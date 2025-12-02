@@ -11,7 +11,7 @@ import pandas as pd
 import numpy as np
 
 # ==========================================
-# 第一部分: 数据加载 (保持不变)
+# 第一部分: 数据加载
 # ==========================================
 
 def load_adjacency_matrix(adj_file, n_nodes=116):
@@ -138,10 +138,13 @@ class MultimodalDataset(Dataset):
                     torch.tensor(0, dtype=torch.long))
 
 # ==========================================
-# 第二部分: 模型定义 (Enhanced Version)
+# 第二部分: 仅包含 GCN 的模型
 # ==========================================
 
 class StructureGatedGCN(nn.Module):
+    """
+    保持原有的强壮结构 (残差 + BN + 结构门控)
+    """
     def __init__(self, n_nodes=116, feature_dim=64):
         super(StructureGatedGCN, self).__init__()
         self.n_nodes = n_nodes
@@ -157,7 +160,7 @@ class StructureGatedGCN(nn.Module):
         self.dropout = nn.Dropout(0.3)
 
     def forward(self, fmri, smri_gmv, adj_static):
-        # 结构门控 (Bias +0.1)
+        # 结构门控
         node_integrity = self.struct_gate(smri_gmv.unsqueeze(-1)) 
         struct_mask = (node_integrity @ node_integrity.transpose(1, 2)) + 0.1
         adj_dynamic = adj_static.unsqueeze(0) * struct_mask
@@ -168,34 +171,33 @@ class StructureGatedGCN(nn.Module):
         
         out = torch.einsum('bmn, btnf -> btmf', adj_dynamic, fmri_feat)
         
-        # Residual
+        # 残差连接
         residual = self.residual_proj(fmri.unsqueeze(-1))
         out = out + residual 
         
         out = F.relu(out)
         out = self.dropout(out)
+        
+        # 节点池化: (Batch, Time, Nodes, Feat) -> (Batch, Time, Feat)
         out = torch.mean(out, dim=2) 
         
         return out 
 
-class Fused_MGRN_Classic(nn.Module):
+class GCN_Only_Model(nn.Module):
+    """
+    无 LSTM 版本：直接对时间维度取平均
+    """
     def __init__(self, n_nodes=116, n_classes=2):
-        super(Fused_MGRN_Classic, self).__init__()
+        super(GCN_Only_Model, self).__init__()
         self.hidden_dim = 64  
-        self.pool_kernel = 4 
         
+        # GCN 模块
         self.struct_gcn = StructureGatedGCN(n_nodes=n_nodes, feature_dim=self.hidden_dim)
         
-        self.lstm = nn.LSTM(
-            input_size=self.hidden_dim, 
-            hidden_size=self.hidden_dim, 
-            num_layers=1, 
-            batch_first=True,
-            dropout=0.0
-        )
-        
+        # Batch Normalization (直接对特征维度归一化)
         self.bn_final = nn.BatchNorm1d(self.hidden_dim)
         
+        # 分类器
         self.classifier = nn.Sequential(
             nn.Linear(self.hidden_dim, 32),
             nn.ReLU(),
@@ -211,81 +213,69 @@ class Fused_MGRN_Classic(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.LSTM):
-                for name, param in m.named_parameters():
-                    if 'weight_ih' in name:
-                        nn.init.xavier_uniform_(param.data)
-                    elif 'weight_hh' in name:
-                        nn.init.orthogonal_(param.data)
-                    elif 'bias' in name:
-                        nn.init.constant_(param.data, 0)
 
     def forward(self, fmri, smri, adj_static):
+        # 1. GCN 提取特征
+        # 输出形状: (Batch, Time, Hidden_Dim)
         gcn_out = self.struct_gcn(fmri, smri, adj_static)
         
-        gcn_out = gcn_out.permute(0, 2, 1) 
-        gcn_out = F.avg_pool1d(gcn_out, kernel_size=self.pool_kernel)
-        lstm_in = gcn_out.permute(0, 2, 1)
+        # 2. 全局时间平均池化 (Global Average Pooling over Time)
+        # 将时序维度压缩：(Batch, 140, 64) -> (Batch, 64)
+        feat = torch.mean(gcn_out, dim=1)
         
-        self.lstm.flatten_parameters()
-        _, (h_n, _) = self.lstm(lstm_in)
+        # 3. BN 和 分类
+        feat = self.bn_final(feat)
+        logits = self.classifier(feat)
         
-        feat = self.bn_final(h_n[-1])
-        return self.classifier(feat)
+        return logits
 
 # ==========================================
-# 第三部分: 五折交叉验证 (核心修改)
+# 第三部分: 训练流程 (五折 CV, 移除早停)
 # ==========================================
 
 def train_k_fold():
-    # --- 路径配置 ---
+    # --- 配置 ---
     base_path = "./"
     fmri_dir = os.path.join(base_path, "datasets", "fMRI")
     smri_file = os.path.join(base_path, "datasets", "GMV_Node_Features.csv")
     label_file = os.path.join(base_path, "datasets", "labels.csv")
     adj_file = os.path.join(base_path, "datasets", "FC.csv")
     
-    # --- 超参数 ---
     BATCH_SIZE = 16
     LEARNING_RATE = 0.001 
-    NUM_EPOCHS = 80     # 每折训练轮数
-    K_FOLDS = 5         # 五折
+    NUM_EPOCHS = 80
+    K_FOLDS = 5
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f" Device: {device}")
+    print(f" Device: {device} (Mode: GCN Only - No Early Stopping)")
 
-    # 1. 准备数据
+    # 1. 数据准备
     if not os.path.exists(adj_file):
         raise FileNotFoundError(f"Missing: {adj_file}")
     adj_static = load_adjacency_matrix(adj_file).to(device)
     
     full_dataset = MultimodalDataset(fmri_dir, smri_file, label_file)
-    all_labels = np.array(full_dataset.labels_list) # 用于分层
+    all_labels = np.array(full_dataset.labels_list)
     all_indices = np.arange(len(full_dataset))
 
-    # 2. 初始化 K-Fold
+    # 2. 交叉验证
     skf = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=42)
-    
-    # 存储每折的结果
     fold_results = []
     
-    print(f"\n 开始 {K_FOLDS} 折交叉验证...")
+    print(f"\n⚡ 开始 {K_FOLDS} 折交叉验证 (GCN Only, Full Epochs)...")
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(all_indices, all_labels)):
         print(f"\n=== Fold {fold+1}/{K_FOLDS} ===")
         
-        # --- A. 数据集切分 ---
         train_subset = Subset(full_dataset, train_idx)
         val_subset = Subset(full_dataset, val_idx)
         
-        # --- B. 训练集加权采样 (防止训练时不平衡) ---
+        # 加权采样
         y_train = all_labels[train_idx]
         class_counts = np.bincount(y_train)
-        class_weights = 1. / class_counts
-        # 防止除零（如果某个类在split中没有样本，虽然StratifiedKFold一般不会）
-        class_weights = np.nan_to_num(class_weights, posinf=0.0)
-        
+        class_weights = np.nan_to_num(1. / class_counts, posinf=0.0)
         sample_weights = class_weights[y_train]
+        
         sampler = WeightedRandomSampler(
             weights=torch.from_numpy(sample_weights).float(),
             num_samples=len(train_idx),
@@ -295,16 +285,15 @@ def train_k_fold():
         train_loader = DataLoader(train_subset, batch_size=BATCH_SIZE, sampler=sampler, drop_last=True)
         val_loader = DataLoader(val_subset, batch_size=BATCH_SIZE, shuffle=False)
         
-        # --- C. 模型初始化 (每折都是新模型) ---
-        model = Fused_MGRN_Classic(n_nodes=116, n_classes=2).to(device)
+        # 初始化模型 (使用 GCN_Only_Model)
+        model = GCN_Only_Model(n_nodes=116, n_classes=2).to(device)
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
         
-        # 记录本折的最佳指标
-        best_fold_bacc = 0.0 # 平衡准确率
-        best_fold_acc = 0.0  # 普通准确率
+        best_fold_bacc = 0.0
+        best_fold_acc = 0.0
         
-        # --- D. 训练循环 ---
+        # [修改] 循环跑满 NUM_EPOCHS，不提前退出
         for epoch in range(NUM_EPOCHS):
             model.train()
             running_loss = 0.0
@@ -321,7 +310,7 @@ def train_k_fold():
                 optimizer.step()
                 running_loss += loss.item()
 
-            # --- E. 验证 (计算平衡准确率) ---
+            # 验证
             model.eval()
             preds_list = []
             targets_list = []
@@ -335,43 +324,38 @@ def train_k_fold():
                     preds_list.extend(predicted.cpu().numpy())
                     targets_list.extend(labels.cpu().numpy())
             
-            # 计算指标
             epoch_acc = np.mean(np.array(preds_list) == np.array(targets_list)) * 100
-            # [核心] 平衡准确率
             epoch_bacc = balanced_accuracy_score(targets_list, preds_list) * 100
             
+            # [修改] 仅记录最佳，不中断循环
             if epoch_bacc > best_fold_bacc:
                 best_fold_bacc = epoch_bacc
                 best_fold_acc = epoch_acc
-                # 可选: 保存每一折的最佳模型
-                torch.save(model.state_dict(), f"./save/best_model_fold_{fold+1}.pth")
+                # 依然可以保存最佳权重，防止跑过头
+                # torch.save(model.state_dict(), f"best_gcn_fold_{fold+1}.pth")
+                print(f"  Epoch {epoch+1}: B-Acc {epoch_bacc:.2f}% 🆙")
             
-            # 简单的日志打印
+            # 每10轮打印一次日志
             if (epoch+1) % 10 == 0:
                 print(f"  Epoch {epoch+1}: Loss {running_loss/len(train_loader):.4f} | Val B-Acc: {epoch_bacc:.2f}% (Best: {best_fold_bacc:.2f}%)")
 
         print(f" Fold {fold+1} 完成. Best Balanced Acc: {best_fold_bacc:.2f}% (Acc: {best_fold_acc:.2f}%)")
         fold_results.append({'fold': fold+1, 'bacc': best_fold_bacc, 'acc': best_fold_acc})
 
-    # --- F. 汇总结果 ---
-    print("\n" + "="*30)
-    print("       5-Fold CV Results       ")
-    print("="*30)
-    avg_bacc = 0.0
-    avg_acc = 0.0
+    # 汇总
+    print("\n" + "="*35)
+    print("   GCN-Only (No LSTM) Results   ")
+    print("="*35)
+    avg_bacc = sum([r['bacc'] for r in fold_results]) / K_FOLDS
+    avg_acc = sum([r['acc'] for r in fold_results]) / K_FOLDS
     
     for res in fold_results:
         print(f"Fold {res['fold']}: Balanced Acc = {res['bacc']:.2f}% | Acc = {res['acc']:.2f}%")
-        avg_bacc += res['bacc']
-        avg_acc += res['acc']
         
-    avg_bacc /= K_FOLDS
-    avg_acc /= K_FOLDS
-    
-    print("-" * 30)
-    print(f"Average Balanced Acc: {avg_bacc:.2f}%")
-    print(f"Average Accuracy    : {avg_acc:.2f}%")
-    print("="*30)
+    print("-" * 35)
+    print(f"Avg Balanced Acc: {avg_bacc:.2f}%")
+    print(f"Avg Accuracy    : {avg_acc:.2f}%")
+    print("="*35)
 
 if __name__ == "__main__":
     train_k_fold()
