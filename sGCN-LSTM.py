@@ -58,17 +58,45 @@ class MultimodalDataset(Dataset):
             print(f"解析标签文件失败: {e}")
             raise e
             
-        # 2. 加载 sMRI
+        # 2. 加载 sMRI 并清洗
         if not os.path.exists(smri_file):
             raise FileNotFoundError(f"找不到 sMRI 文件: {smri_file}")
             
+        # 读取原始数据
+        print(f"--- 正在加载并清洗 sMRI 数据: {smri_file} ---")
         self.smri_df = pd.read_csv(smri_file)
+        
+        # 设置索引 (Subject_ID)
         if 'Subject_ID' in self.smri_df.columns:
             self.smri_df = self.smri_df.set_index('Subject_ID')
         else:
             self.smri_df = self.smri_df.set_index(self.smri_df.columns[0])
 
-        # 3. 匹配数据
+        # ==========================================
+        # [新增] 数据清洗逻辑: 剔除含 0 的样本
+        # ==========================================
+        initial_count = len(self.smri_df)
+        
+        # 检查每一行，如果该行所有列(脑区)都不为0，则保留
+        # axis=1 表示对每一行操作
+        valid_mask = (self.smri_df != 0).all(axis=1)
+        
+        # 找出被剔除的 ID (可选，用于调试)
+        # dropped_ids = self.smri_df[~valid_mask].index.tolist()
+        # print(f"剔除的异常样本 ID: {dropped_ids}")
+        
+        # 执行剔除
+        self.smri_df = self.smri_df[valid_mask]
+        
+        dropped_count = initial_count - len(self.smri_df)
+        if dropped_count > 0:
+            print(f" 警告: 已剔除 {dropped_count} 个含有 0 值(异常脑区)的样本。")
+            print(f"   剩余有效 sMRI 样本数: {len(self.smri_df)}")
+        else:
+            print(" sMRI 数据质量良好，未发现含 0 值的样本。")
+        # ==========================================
+
+        # 3. 匹配数据 (fMRI + sMRI + Label)
         self.data_list = [] 
         self.labels_list = [] 
         
@@ -86,6 +114,7 @@ class MultimodalDataset(Dataset):
             else:
                 short_id = long_id
             
+            # 只有当 ID 同时存在于 清洗后的 sMRI表 和 标签表 中才匹配
             if short_id in self.label_map and long_id in self.smri_df.index:
                 label = self.label_map[short_id]
                 f_path = os.path.join(fmri_dir, f_file)
@@ -93,9 +122,9 @@ class MultimodalDataset(Dataset):
                 self.labels_list.append(label)
                 match_count += 1
                 
-        print(f" 数据集初始化: 找到 {match_count} 个完整样本。")
+        print(f" 最终匹配完成: 共有 {match_count} 个完整且有效的样本参与训练。")
         if match_count == 0:
-            raise RuntimeError("数据匹配失败")
+            raise RuntimeError("数据匹配失败，请检查是否所有样本都被清洗掉了？")
 
     def __len__(self):
         return len(self.data_list)
@@ -104,6 +133,7 @@ class MultimodalDataset(Dataset):
         f_path, subject_id, label = self.data_list[idx]
         
         try:
+            # 读取 fMRI
             fmri_data = pd.read_csv(f_path, header=None).values.astype(np.float32)
             if fmri_data.shape != (self.n_time_steps, self.n_nodes):
                 if fmri_data.shape == (self.n_nodes, self.n_time_steps):
@@ -117,10 +147,12 @@ class MultimodalDataset(Dataset):
             scaler = StandardScaler()
             fmri_data = scaler.fit_transform(fmri_data) 
 
+            # 读取 sMRI
             smri_row = self.smri_df.loc[subject_id].values.astype(np.float32)
             if smri_row.shape[0] != self.n_nodes:
                  smri_row = smri_row[:self.n_nodes]
             
+            # 归一化
             if np.std(smri_row) > 0:
                 smri_row = (smri_row - np.mean(smri_row)) / np.std(smri_row)
             else:
