@@ -285,7 +285,7 @@ class Fused_MGRN_Classic(nn.Module):
         return self.classifier(feat)
 
 # ==========================================
-# 第三部分: 五折交叉验证 (核心修改)
+# 第三部分: 五折交叉验证
 # ==========================================
 
 def train_k_fold():
@@ -401,7 +401,7 @@ def train_k_fold():
             
             # 计算指标
             epoch_acc = np.mean(np.array(preds_list) == np.array(targets_list)) * 100
-            # [核心] 平衡准确率
+            # 平衡准确率
             epoch_bacc = balanced_accuracy_score(targets_list, preds_list) * 100
             
             if epoch_bacc > best_fold_bacc:
@@ -409,7 +409,7 @@ def train_k_fold():
                 best_fold_acc = epoch_acc
                 logging.info(f"  [Fold {fold+1}] Epoch {epoch+1}: B-Acc {epoch_bacc:.2f}% (New Best)")
                 # 可选: 保存每一折的最佳模型
-                torch.save(model.state_dict(), f"./save/best_model_lstm_fold_{fold+1}.pth")
+                #torch.save(model.state_dict(), f"./save/best_model_lstm_fold_{fold+1}.pth")
             
             # 简单的日志打印
             if (epoch+1) % 10 == 0:

@@ -288,7 +288,7 @@ class Fused_MGRN_4VQC(nn.Module):
         return self.classifier(feat)
 
 # ==========================================
-# 4. 训练流程 (带日志记录)
+# 4. 训练流程
 # ==========================================
 
 def train_k_fold():
@@ -315,7 +315,7 @@ def train_k_fold():
     NUM_EPOCHS = 60
     K_FOLDS = 5
     
-    device = torch.device("cpu") # 推荐 CPU 用于 PennyLane
+    device = torch.device("cpu") 
     logging.info(f" 计算设备: {device} (4-VQC 模式)")
 
     if not os.path.exists(adj_file):

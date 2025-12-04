@@ -194,7 +194,7 @@ class MultimodalDataset(Dataset):
 
 class StructureGatedGCN(nn.Module):
     """
-    保持原有的强壮结构 (残差 + BN + 结构门控)
+    残差 + BN + 结构门控
     """
     def __init__(self, n_nodes=116, feature_dim=64):
         super(StructureGatedGCN, self).__init__()
@@ -390,13 +390,13 @@ def train_k_fold():
             epoch_acc = np.mean(np.array(preds_list) == np.array(targets_list)) * 100
             epoch_bacc = balanced_accuracy_score(targets_list, preds_list) * 100
             
-            # [修改] 仅记录最佳
+            # 仅记录最佳
             if epoch_bacc > best_fold_bacc:
                 best_fold_bacc = epoch_bacc
                 best_fold_acc = epoch_acc
                 logging.info(f"  [Fold {fold+1}] Epoch {epoch+1}: B-Acc {epoch_bacc:.2f}% (New Best)")
-                # 依然可以保存最佳权重
-                torch.save(model.state_dict(), f"./save/best_gcn_fold_{fold+1}.pth")
+                # 保存最佳权重
+                #torch.save(model.state_dict(), f"./save/best_gcn_fold_{fold+1}.pth")
             
             # 每10轮打印一次日志
             if (epoch+1) % 10 == 0:
