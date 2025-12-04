@@ -22,7 +22,7 @@ import time
 def setup_logger():
     # 创建带时间戳的日志文件名
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"./logging/training_log_{timestamp}.txt"
+    log_filename = f"./logging/training_log_qlstm_{timestamp}.txt"
     
     # 配置 logging
     logging.basicConfig(

@@ -9,13 +9,40 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, balanced_accuracy_score
 import pandas as pd
 import numpy as np
+import logging
+from datetime import datetime
+import time
 
 # ==========================================
-# 第一部分: 数据加载 (保持不变)
+# 0. 日志配置 (Setup)
+# ==========================================
+
+def setup_logger():
+    # 确保日志目录存在
+    os.makedirs("./logging", exist_ok=True)
+    
+    # 创建带时间戳的日志文件名
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f"./logging/training_log_lstm_{timestamp}.txt"
+    
+    # 配置 logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[
+            logging.FileHandler(log_filename), # 输出到文件
+            logging.StreamHandler()            # 输出到控制台
+        ]
+    )
+    return log_filename
+
+# ==========================================
+# 第一部分: 数据加载
 # ==========================================
 
 def load_adjacency_matrix(adj_file, n_nodes=116):
-    print(f"--- 正在加载邻接矩阵: {adj_file} ---")
+    logging.info(f"--- 正在加载邻接矩阵: {adj_file} ---")
     try:
         adj_np = pd.read_csv(adj_file, header=None).values.astype(np.float32)
         if adj_np.shape != (n_nodes, n_nodes):
@@ -31,10 +58,10 @@ def load_adjacency_matrix(adj_file, n_nodes=116):
         D_mat = torch.diag(D_inv_sqrt)
         adj_normalized = D_mat @ A_tilde @ D_mat
         
-        print(" 邻接矩阵加载并归一化完成。")
+        logging.info(" 邻接矩阵加载并归一化完成。")
         return adj_normalized
     except Exception as e:
-        print(f"加载邻接矩阵时出错: {e}")
+        logging.error(f"加载邻接矩阵时出错: {e}")
         raise e
 
 class MultimodalDataset(Dataset):
@@ -55,7 +82,7 @@ class MultimodalDataset(Dataset):
                         clean_label = int(parts[1].strip().replace(",", ""))
                         self.label_map[clean_id] = clean_label
         except Exception as e:
-            print(f"解析标签文件失败: {e}")
+            logging.error(f"解析标签文件失败: {e}")
             raise e
             
         # 2. 加载 sMRI 并清洗
@@ -63,7 +90,7 @@ class MultimodalDataset(Dataset):
             raise FileNotFoundError(f"找不到 sMRI 文件: {smri_file}")
             
         # 读取原始数据
-        print(f"--- 正在加载并清洗 sMRI 数据: {smri_file} ---")
+        logging.info(f"--- 正在加载并清洗 sMRI 数据: {smri_file} ---")
         self.smri_df = pd.read_csv(smri_file)
         
         # 设置索引 (Subject_ID)
@@ -73,28 +100,20 @@ class MultimodalDataset(Dataset):
             self.smri_df = self.smri_df.set_index(self.smri_df.columns[0])
 
         # ==========================================
-        # [新增] 数据清洗逻辑: 剔除含 0 的样本
+        # 数据清洗逻辑: 剔除含 0 的样本
         # ==========================================
         initial_count = len(self.smri_df)
         
         # 检查每一行，如果该行所有列(脑区)都不为0，则保留
-        # axis=1 表示对每一行操作
         valid_mask = (self.smri_df != 0).all(axis=1)
-        
-        # 找出被剔除的 ID (可选，用于调试)
-        # dropped_ids = self.smri_df[~valid_mask].index.tolist()
-        # print(f"剔除的异常样本 ID: {dropped_ids}")
-        
-        # 执行剔除
         self.smri_df = self.smri_df[valid_mask]
         
         dropped_count = initial_count - len(self.smri_df)
         if dropped_count > 0:
-            print(f" 警告: 已剔除 {dropped_count} 个含有 0 值(异常脑区)的样本。")
-            print(f"   剩余有效 sMRI 样本数: {len(self.smri_df)}")
+            logging.warning(f" 警告: 已剔除 {dropped_count} 个含有 0 值(异常脑区)的样本。")
+            logging.info(f"   剩余有效 sMRI 样本数: {len(self.smri_df)}")
         else:
-            print(" sMRI 数据质量良好，未发现含 0 值的样本。")
-        # ==========================================
+            logging.info(" sMRI 数据质量良好，未发现含 0 值的样本。")
 
         # 3. 匹配数据 (fMRI + sMRI + Label)
         self.data_list = [] 
@@ -122,7 +141,7 @@ class MultimodalDataset(Dataset):
                 self.labels_list.append(label)
                 match_count += 1
                 
-        print(f" 最终匹配完成: 共有 {match_count} 个完整且有效的样本参与训练。")
+        logging.info(f" 最终匹配完成: 共有 {match_count} 个完整且有效的样本参与训练。")
         if match_count == 0:
             raise RuntimeError("数据匹配失败，请检查是否所有样本都被清洗掉了？")
 
@@ -164,7 +183,7 @@ class MultimodalDataset(Dataset):
                 torch.tensor(label, dtype=torch.long)
             )
         except Exception as e:
-            print(f"读取数据出错 (ID: {subject_id}): {e}")
+            logging.error(f"读取数据出错 (ID: {subject_id}): {e}")
             return (torch.zeros(self.n_time_steps, self.n_nodes), 
                     torch.zeros(self.n_nodes), 
                     torch.tensor(0, dtype=torch.long))
@@ -270,6 +289,17 @@ class Fused_MGRN_Classic(nn.Module):
 # ==========================================
 
 def train_k_fold():
+    # --- 初始化日志 ---
+    log_file = setup_logger()
+    
+    # 记录开始时间
+    start_time = datetime.now()
+    logging.info(f"==========================================")
+    logging.info(f" 训练任务开始 (sGCN-LSTM)")
+    logging.info(f" 开始时间: {start_time}")
+    logging.info(f" 日志文件: {log_file}")
+    logging.info(f"==========================================")
+
     # --- 路径配置 ---
     base_path = "./"
     fmri_dir = os.path.join(base_path, "datasets", "fMRI")
@@ -284,11 +314,12 @@ def train_k_fold():
     K_FOLDS = 5         # 五折
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f" Device: {device}")
+    logging.info(f" Device: {device}")
 
     # 1. 准备数据
     if not os.path.exists(adj_file):
-        raise FileNotFoundError(f"Missing: {adj_file}")
+        logging.error(f"Missing: {adj_file}")
+        return
     adj_static = load_adjacency_matrix(adj_file).to(device)
     
     full_dataset = MultimodalDataset(fmri_dir, smri_file, label_file)
@@ -301,10 +332,11 @@ def train_k_fold():
     # 存储每折的结果
     fold_results = []
     
-    print(f"\n 开始 {K_FOLDS} 折交叉验证...")
+    logging.info(f" 开始 {K_FOLDS} 折交叉验证...")
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(all_indices, all_labels)):
-        print(f"\n=== Fold {fold+1}/{K_FOLDS} ===")
+        logging.info(f"\n=== Fold {fold+1}/{K_FOLDS} 开始 ===")
+        fold_start_time = time.time()
         
         # --- A. 数据集切分 ---
         train_subset = Subset(full_dataset, train_idx)
@@ -314,7 +346,7 @@ def train_k_fold():
         y_train = all_labels[train_idx]
         class_counts = np.bincount(y_train)
         class_weights = 1. / class_counts
-        # 防止除零（如果某个类在split中没有样本，虽然StratifiedKFold一般不会）
+        # 防止除零
         class_weights = np.nan_to_num(class_weights, posinf=0.0)
         
         sample_weights = class_weights[y_train]
@@ -375,35 +407,42 @@ def train_k_fold():
             if epoch_bacc > best_fold_bacc:
                 best_fold_bacc = epoch_bacc
                 best_fold_acc = epoch_acc
+                logging.info(f"  [Fold {fold+1}] Epoch {epoch+1}: B-Acc {epoch_bacc:.2f}% (New Best)")
                 # 可选: 保存每一折的最佳模型
-                torch.save(model.state_dict(), f"./save/best_model_fold_{fold+1}.pth")
+                torch.save(model.state_dict(), f"./save/best_model_lstm_fold_{fold+1}.pth")
             
             # 简单的日志打印
             if (epoch+1) % 10 == 0:
-                print(f"  Epoch {epoch+1}: Loss {running_loss/len(train_loader):.4f} | Val B-Acc: {epoch_bacc:.2f}% (Best: {best_fold_bacc:.2f}%)")
+                logging.info(f"  [Fold {fold+1}] Epoch {epoch+1}: Loss {running_loss/len(train_loader):.4f} | Val B-Acc: {epoch_bacc:.2f}%")
 
-        print(f" Fold {fold+1} 完成. Best Balanced Acc: {best_fold_bacc:.2f}% (Acc: {best_fold_acc:.2f}%)")
+        fold_duration = time.time() - fold_start_time
+        logging.info(f" Fold {fold+1} 完成. 耗时: {fold_duration/60:.2f}分. Best Balanced Acc: {best_fold_bacc:.2f}% (Acc: {best_fold_acc:.2f}%)")
         fold_results.append({'fold': fold+1, 'bacc': best_fold_bacc, 'acc': best_fold_acc})
 
     # --- F. 汇总结果 ---
-    print("\n" + "="*30)
-    print("       5-Fold CV Results       ")
-    print("="*30)
-    avg_bacc = 0.0
-    avg_acc = 0.0
+    logging.info("\n" + "="*35)
+    logging.info("      5-Fold CV Results (sGCN-LSTM)      ")
+    logging.info("="*35)
+    avg_bacc = sum([r['bacc'] for r in fold_results]) / K_FOLDS
+    avg_acc = sum([r['acc'] for r in fold_results]) / K_FOLDS
     
     for res in fold_results:
-        print(f"Fold {res['fold']}: Balanced Acc = {res['bacc']:.2f}% | Acc = {res['acc']:.2f}%")
-        avg_bacc += res['bacc']
-        avg_acc += res['acc']
+        logging.info(f"Fold {res['fold']}: Balanced Acc = {res['bacc']:.2f}% | Acc = {res['acc']:.2f}%")
         
-    avg_bacc /= K_FOLDS
-    avg_acc /= K_FOLDS
+    logging.info("-" * 35)
+    logging.info(f"Average Balanced Acc: {avg_bacc:.2f}%")
+    logging.info(f"Average Accuracy    : {avg_acc:.2f}%")
+    logging.info("="*35)
     
-    print("-" * 30)
-    print(f"Average Balanced Acc: {avg_bacc:.2f}%")
-    print(f"Average Accuracy    : {avg_acc:.2f}%")
-    print("="*30)
+    # 记录结束时间
+    end_time = datetime.now()
+    duration = end_time - start_time
+    logging.info(f"==========================================")
+    logging.info(f" 训练任务结束")
+    logging.info(f" 结束时间: {end_time}")
+    logging.info(f" 总耗时: {duration}")
+    logging.info(f"==========================================")
+    print(f"训练日志已保存至: {log_file}")
 
 if __name__ == "__main__":
     train_k_fold()
