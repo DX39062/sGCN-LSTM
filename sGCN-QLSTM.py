@@ -228,7 +228,7 @@ class QLSTM_Cell(nn.Module):
         return hidden_seq, (h_t, c_t)
 
 # ==========================================
-# 3. 混合模型定义
+# 3. 模型定义
 # ==========================================
 
 class StructureGatedGCN(nn.Module):
@@ -253,7 +253,7 @@ class StructureGatedGCN(nn.Module):
         out = out + residual 
         out = F.relu(out)
         out = self.dropout(out)
-        out = torch.mean(out, dim=2) 
+        out = torch.mean(out, dim=2) #降维
         return out 
 
 class Fused_MGRN_4VQC(nn.Module):
